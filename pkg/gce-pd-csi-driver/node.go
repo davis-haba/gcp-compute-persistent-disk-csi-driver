@@ -51,6 +51,10 @@ type GCENodeServer struct {
 	// for that same volume (as defined by VolumeID) return an Aborted error
 	volumeLocks *common.VolumeLocks
 
+	// deviceInUseErrors keeps tracks of device names and a timestamp for when an error is
+	// encounted for that device
+	deviceInUseErrors map[string]time.Time
+
 	// If set, this semaphore will be used to serialize formatAndMount. It will be raised
 	// when the operation starts, and lowered either when finished, or when
 	// formatAndMountTimeout has expired.
@@ -81,6 +85,8 @@ const (
 	fsTypeExt3                 = "ext3"
 
 	readAheadKBMountFlagRegexPattern = "^read_ahead_kb=(.+)$"
+
+	deviceInUseTimeout = 30
 )
 
 var (
@@ -94,6 +100,31 @@ func getDefaultFsType() string {
 		return defaultLinuxFsType
 	}
 }
+
+// checkDeviceErrorTimeout returns true an error was encounted for the specified deviceName,
+// where the error happened at least `deviceInUseTimeout` seconds ago.
+func (ns *GCENodeServer) checkDeviceErrorTimeout(deviceName string) bool {
+	if ns.deviceInUseErrors == nil {
+		ns.deviceInUseErrors = make(map[string]time.Time)
+	}
+
+	lastErrTime, exists := ns.deviceInUseErrors[deviceName]
+	if exists && time.Now().Sub(lastErrTime).Seconds() >= deviceInUseTimeout {
+		return true
+	}
+	return false
+}
+
+// markDeviceError updates the internal `deviceInUseErrors` map to denote an error was encounted
+// for the specified deviceName at the current time
+func (ns *GCENodeServer) markDeviceError(deviceName string) {
+	if ns.deviceInUseErrors == nil {
+		ns.deviceInUseErrors = make(map[string]time.Time)
+	}
+
+	ns.deviceInUseErrors[deviceName] = time.Now()
+}
+
 func (ns *GCENodeServer) isVolumePathMounted(path string) bool {
 	notMnt, err := ns.Mounter.Interface.IsLikelyNotMountPoint(path)
 	klog.V(4).Infof("Checking volume path %s is mounted %t: error %v", path, !notMnt, err)
@@ -446,12 +477,24 @@ func (ns *GCENodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUns
 		return nil, status.Error(codes.InvalidArgument, "NodeUnstageVolume Staging Target Path must be provided")
 	}
 
+	// If the device has not been unstaged due to an error, and more than `deviceInUseTimeout` seconds have passed, then force release it
+	if ns.checkDeviceErrorTimeout(volumeID) {
+		klog.Warningf("Device %s could not be released after timeout of %d seconds. Force releasing device", volumeID, deviceInUseTimeout)
+		delete(ns.deviceInUseErrors, volumeID)
+		if err := cleanupStagePath(stagingTargetPath, ns.Mounter); err != nil {
+			klog.Warningf("Encounted error unstaging volume %s after exceeding error timeout: %v", volumeID, err)
+		}
+		return &csi.NodeUnstageVolumeResponse{}, nil
+	}
+
 	if acquired := ns.volumeLocks.TryAcquire(volumeID); !acquired {
+		ns.markDeviceError(volumeID)
 		return nil, status.Errorf(codes.Aborted, common.VolumeOperationAlreadyExistsFmt, volumeID)
 	}
 	defer ns.volumeLocks.Release(volumeID)
 
 	if err := cleanupStagePath(stagingTargetPath, ns.Mounter); err != nil {
+		ns.markDeviceError(volumeID)
 		return nil, status.Error(codes.Internal, fmt.Sprintf("NodeUnstageVolume failed: %v\nUnmounting arguments: %s\n", err.Error(), stagingTargetPath))
 	}
 
@@ -460,10 +503,12 @@ func (ns *GCENodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUns
 		if errors.As(err, &targetErr) {
 			klog.Warningf("Unabled to check if device for %s is unused. Device has been unmounted successfully. Ignoring and continuing with unstaging. (%v)", volumeID, err)
 		} else {
+			ns.markDeviceError(volumeID)
 			return nil, status.Errorf(codes.Internal, "NodeUnstageVolume for volume %s failed: %v", volumeID, err)
 		}
 	}
 
+	delete(ns.deviceInUseErrors, volumeID)
 	klog.V(4).Infof("NodeUnstageVolume succeeded on %v from %s", volumeID, stagingTargetPath)
 	return &csi.NodeUnstageVolumeResponse{}, nil
 }
